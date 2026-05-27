@@ -6,8 +6,8 @@
 # MAGIC
 # MAGIC | Approach | How it scales |
 # MAGIC |----------|---------------|
-# MAGIC | **Legacy** — `ALTER TABLE … SET MASK fn()` | One DDL per column. 50 PII columns × 30 tables = 1,500 statements to maintain. |
-# MAGIC | **ABAC** — `CREATE POLICY … COLUMN MASK ON COLUMN TAG('sensitivity_level','pii')` | One policy. Applies automatically to every column tagged `pii`, today and in the future. |
+# MAGIC | **Legacy** — `ALTER TABLE … SET MASK fn` | One DDL per column. 50 PII columns × 30 tables = 1,500 statements to maintain. |
+# MAGIC | **ABAC** — `CREATE POLICY … COLUMN MASK … MATCH COLUMNS has_tag_value('demo_sensitivity','pii')` | One policy. Applies automatically to every column tagged `pii`, today and in the future. |
 # MAGIC
 # MAGIC The data model is identical. The maintenance story is night-and-day.
 
@@ -34,8 +34,7 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- 1. Write a masking UDF.
-# MAGIC --    GOTCHA: the parameter must match the column type. Members of pii-readers see the original; everyone else sees masked.
+# MAGIC -- 1. Write a masking UDF. Members of `pii-readers` see the original; everyone else sees masked.
 # MAGIC CREATE OR REPLACE FUNCTION mask_email_legacy(input_email STRING)
 # MAGIC RETURNS STRING
 # MAGIC RETURN CASE
@@ -49,8 +48,9 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Verify the mask works for the current user. As an admin/account-admins member you'll likely see the original;
-# MAGIC -- the demo lands harder when run as a non-admin teammate or after temporarily removing yourself from account admins.
+# MAGIC -- Verify the mask works for the current user. As an admin/account-admins member you'll likely see
+# MAGIC -- the original; the demo lands harder when run as a non-admin teammate or after temporarily removing
+# MAGIC -- yourself from account admins.
 # MAGIC SELECT customer_id, full_name, email FROM customers LIMIT 5;
 
 # COMMAND ----------
@@ -78,11 +78,11 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # MAGIC %md
 # MAGIC ## Approach B — ABAC `CREATE POLICY ... COLUMN MASK`
 # MAGIC
-# MAGIC One policy. It looks at the governed tag (`sensitivity_level`) and applies wherever it's set to `pii`. New PII columns get protected the moment they're tagged.
+# MAGIC One policy. It looks at the governed tag (`demo_sensitivity`) and applies wherever it's set to `pii`. New PII columns get protected the moment they're tagged.
 # MAGIC
-# MAGIC ### The masking UDFs
+# MAGIC ### The masking UDF
 # MAGIC
-# MAGIC One per data type we want to mask. Note the parameter name `column_value` — this is the **required** placeholder name when used by an ABAC policy.
+# MAGIC `column_value` is the **required** placeholder name when used by an ABAC policy.
 
 # COMMAND ----------
 
@@ -93,39 +93,29 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # MAGIC   WHEN is_account_group_member('pii-readers') THEN column_value
 # MAGIC   ELSE '***REDACTED***'
 # MAGIC END;
-# MAGIC
-# MAGIC CREATE OR REPLACE FUNCTION mask_pii_date(column_value DATE)
-# MAGIC RETURNS DATE
-# MAGIC RETURN CASE
-# MAGIC   WHEN is_account_group_member('pii-readers') THEN column_value
-# MAGIC   ELSE CAST(date_trunc('year', column_value) AS DATE)   -- coarsen DOB to year
-# MAGIC END;
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ### The ABAC policy
 # MAGIC
-# MAGIC Hits every column tagged `sensitivity_level = 'pii'`, applying the right UDF based on data type.
+# MAGIC Hits every column tagged `demo_sensitivity = 'pii'` across the entire catalog.
+# MAGIC
+# MAGIC > **Note on the `TO` clause** — ABAC policies require a principal in the `TO` clause. Using `` `account users` `` (the built-in group containing every user) means the policy is *evaluated* for everyone. The UDF itself decides who gets the unmasked value via `is_account_group_member('pii-readers')`. Alternative: `TO \`account users\` EXCEPT \`pii-readers\`` skips the policy entirely for the readers group — slightly cleaner but harder to introspect.
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC DROP POLICY IF EXISTS mask_all_pii_strings ON CATALOG demos;
-# MAGIC
-# MAGIC CREATE POLICY mask_all_pii_strings ON CATALOG demos
-# MAGIC COMMENT 'Mask any STRING column tagged sensitivity_level=pii'
-# MAGIC COLUMN MASK mask_pii_string
-# MAGIC FOR TABLES MATCH COLUMNS has_tag_value('sensitivity_level', 'pii') AS c
-# MAGIC   ON COLUMN c;
-# MAGIC
-# MAGIC DROP POLICY IF EXISTS mask_all_pii_dates ON CATALOG demos;
-# MAGIC
-# MAGIC CREATE POLICY mask_all_pii_dates ON CATALOG demos
-# MAGIC COMMENT 'Coarsen any DATE column tagged sensitivity_level=pii'
-# MAGIC COLUMN MASK mask_pii_date
-# MAGIC FOR TABLES MATCH COLUMNS has_tag_value('sensitivity_level', 'pii') AS c
-# MAGIC   ON COLUMN c;
+policy_sql = f"""
+CREATE POLICY mask_all_pii_strings ON CATALOG `{catalog}`
+COMMENT 'Mask any STRING column tagged demo_sensitivity=pii'
+COLUMN MASK mask_pii_string
+TO `account users`
+FOR TABLES MATCH COLUMNS has_tag_value('demo_sensitivity', 'pii') AS c
+  ON COLUMN c
+"""
+spark.sql(f"DROP POLICY IF EXISTS mask_all_pii_strings ON CATALOG `{catalog}`")
+spark.sql(policy_sql)
+print("Policy mask_all_pii_strings created.")
 
 # COMMAND ----------
 
@@ -142,25 +132,51 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- support_notes.note_text and .agent_name are also tagged 'pii' — same policy hits them.
-# MAGIC SELECT note_id, customer_id, agent_name, note_text FROM support_notes LIMIT 5;
+# MAGIC -- `support_notes.note_text` and `.agent_name` are also tagged `pii` — same policy hits them.
+# MAGIC SELECT note_id, customer_id, agent_name, substring(note_text, 1, 80) AS note_preview FROM support_notes LIMIT 5;
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### A note about data types
+# MAGIC
+# MAGIC The policy above only applies to **STRING** columns. ABAC currently requires:
+# MAGIC
+# MAGIC 1. **One mask UDF per data type** — STRING UDFs can't operate on DATE columns, and vice versa.
+# MAGIC 2. **No overlapping `MATCH COLUMNS`** — UC rejects queries when two policies match the same column.
+# MAGIC
+# MAGIC So you can't have one tag (`demo_sensitivity=pii`) and two policies (one for strings, one for dates) targeting it. The workaround is **per-type tag values** — e.g. `demo_sensitivity=pii_string` and `demo_sensitivity=pii_date`, with one policy each. This demo keeps things simple by only masking strings; the same pattern extends to dates, integers, etc.
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## The "one new column" test
 # MAGIC
-# MAGIC Add a column. Tag it `pii`. The policy picks it up automatically — no new DDL, no ALTER.
+# MAGIC Add a column. Tag it `pii`. The policy picks it up automatically — no new DDL, no `ALTER`.
 
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC ALTER TABLE customers ADD COLUMN passport_number STRING;
+# MAGIC -- If you're re-running the notebook, untag first so the "before" step shows unmasked values.
+# MAGIC ALTER TABLE customers ALTER COLUMN passport_number UNSET TAGS ('demo_sensitivity');
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC -- Add and populate a new sensitive column (idempotent).
+# MAGIC ALTER TABLE customers ADD COLUMN IF NOT EXISTS passport_number STRING;
 # MAGIC UPDATE customers SET passport_number = concat('P', cast(customer_id * 17 AS STRING));
-# MAGIC SET TAG sensitivity_level = 'pii' ON COLUMN customers.passport_number;
 # MAGIC
-# MAGIC -- The new column is masked immediately — the policy already covered it.
-# MAGIC SELECT customer_id, full_name, passport_number FROM customers LIMIT 5;
+# MAGIC -- Before tag: unmasked.
+# MAGIC SELECT customer_id, passport_number FROM customers LIMIT 3;
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC ALTER TABLE customers ALTER COLUMN passport_number SET TAGS ('demo_sensitivity' = 'pii');
+# MAGIC
+# MAGIC -- After tag: masked, immediately — the policy already covered it.
+# MAGIC SELECT customer_id, passport_number FROM customers LIMIT 3;
 
 # COMMAND ----------
 
@@ -181,10 +197,7 @@ spark.sql(f"USE SCHEMA `{schema}`")
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC -- DROP POLICY IF EXISTS mask_all_pii_strings ON CATALOG demos;
-# MAGIC -- DROP POLICY IF EXISTS mask_all_pii_dates   ON CATALOG demos;
-# MAGIC -- DROP FUNCTION IF EXISTS mask_pii_string;
-# MAGIC -- DROP FUNCTION IF EXISTS mask_pii_date;
-# MAGIC -- DROP FUNCTION IF EXISTS mask_email_legacy;
-# MAGIC -- ALTER TABLE customers DROP COLUMN passport_number;
+# spark.sql(f"DROP POLICY IF EXISTS mask_all_pii_strings ON CATALOG `{catalog}`")
+# spark.sql("DROP FUNCTION IF EXISTS mask_pii_string")
+# spark.sql("DROP FUNCTION IF EXISTS mask_email_legacy")
+# spark.sql("ALTER TABLE customers DROP COLUMN IF EXISTS passport_number")

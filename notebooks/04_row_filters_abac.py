@@ -24,18 +24,18 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # MAGIC %md
 # MAGIC ## Approach A — Legacy `SET ROW FILTER`
 # MAGIC
-# MAGIC A UDF that returns a BOOLEAN per row, attached to one table.
+# MAGIC A UDF that returns BOOLEAN per row, attached to one table at a time.
+# MAGIC
+# MAGIC > **Demo runner bypass** — the UDF includes `is_member('admins')` so workspace admins (you, running the demo) always see all rows. Remove that clause when wiring up a real customer environment.
 
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- UDF: returns TRUE if the user is allowed to see this row's region.
-# MAGIC -- Admin override + per-region group membership.
 # MAGIC CREATE OR REPLACE FUNCTION region_filter(region_col STRING)
 # MAGIC RETURNS BOOLEAN
 # MAGIC RETURN
-# MAGIC   is_account_group_member('account admins')
-# MAGIC   OR is_account_group_member('pii-readers')
+# MAGIC   is_member('admins')                                                       -- demo-runner bypass
+# MAGIC   OR is_account_group_member('pii-readers')                                 -- privileged readers
 # MAGIC   OR (is_account_group_member('analysts-east') AND region_col = 'east')
 # MAGIC   OR (is_account_group_member('analysts-west') AND region_col = 'west');
 # MAGIC
@@ -45,8 +45,8 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Run as an east analyst → only sees region='east'.
-# MAGIC -- Run as admin → sees everything.
+# MAGIC -- As workspace admin, you see all regions. Run this query as `analysts-east` (incognito, second user)
+# MAGIC -- to see only east rows.
 # MAGIC SELECT region, count(*) AS rows_visible
 # MAGIC FROM transactions
 # MAGIC GROUP BY region
@@ -57,7 +57,7 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # MAGIC %md
 # MAGIC ### The same problem as masks
 # MAGIC
-# MAGIC We attached the filter to `transactions`. We also need it on `customers` (also has a `region` column). And on `support_notes` once we add a region join, and on any future table…
+# MAGIC We attached the filter to `transactions`. We also need it on `customers` (also has `region`), on `support_notes` once we add a region join, on any future table that ever gets a `region` column…
 # MAGIC
 # MAGIC Detach and switch to ABAC.
 
@@ -71,29 +71,29 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # MAGIC %md
 # MAGIC ## Approach B — ABAC `CREATE POLICY ... ROW FILTER`
 # MAGIC
-# MAGIC One policy. Applies to every table that has a column tagged `region_scope`. Tag a new table's region column → filtered automatically.
+# MAGIC One policy. Applies to every table that has a column tagged `demo_row_scope = 'region'`. Tag a new table's region column → filtered automatically.
 # MAGIC
 # MAGIC ### Step 1 — add a second governed tag for row-scope identifiers
+# MAGIC
+# MAGIC > **Account-level reminder** — this `CREATE GOVERNED TAG` will fail if the tag already exists in the account. Use a unique name per demo or have an account admin drop it first.
 
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC DROP GOVERNED TAG IF EXISTS row_scope;
-# MAGIC
-# MAGIC CREATE GOVERNED TAG row_scope
-# MAGIC   DESCRIPTION 'Marks the column that should be used for row-level scoping'
+# MAGIC CREATE GOVERNED TAG demo_row_scope
+# MAGIC   DESCRIPTION 'Marks the column that should be used for row-level scoping (uc-governance-demo)'
 # MAGIC   VALUES ('region');
 # MAGIC
 # MAGIC -- Tag the region column on every table that has one.
-# MAGIC SET TAG row_scope = 'region' ON COLUMN customers.region;
-# MAGIC SET TAG row_scope = 'region' ON COLUMN transactions.region;
+# MAGIC ALTER TABLE customers    ALTER COLUMN region SET TAGS ('demo_row_scope' = 'region');
+# MAGIC ALTER TABLE transactions ALTER COLUMN region SET TAGS ('demo_row_scope' = 'region');
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ### Step 2 — the row filter UDF
 # MAGIC
-# MAGIC Same boolean logic. The parameter name must match the column name pattern declared in the policy's `MATCH COLUMNS` clause.
+# MAGIC The parameter name must match the alias declared in the policy's `MATCH COLUMNS ... AS` clause.
 
 # COMMAND ----------
 
@@ -101,7 +101,7 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # MAGIC CREATE OR REPLACE FUNCTION region_filter_abac(region STRING)
 # MAGIC RETURNS BOOLEAN
 # MAGIC RETURN
-# MAGIC   is_account_group_member('account admins')
+# MAGIC   is_member('admins')
 # MAGIC   OR is_account_group_member('pii-readers')
 # MAGIC   OR (is_account_group_member('analysts-east') AND region = 'east')
 # MAGIC   OR (is_account_group_member('analysts-west') AND region = 'west');
@@ -110,17 +110,24 @@ spark.sql(f"USE SCHEMA `{schema}`")
 
 # MAGIC %md
 # MAGIC ### Step 3 — the ABAC policy
+# MAGIC
+# MAGIC Note the differences from `COLUMN MASK`:
+# MAGIC - Uses `USING COLUMNS (...)` (not `ON COLUMN`) to pass the matched column to the UDF
+# MAGIC - The `TO` clause comes before `FOR TABLES`
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC DROP POLICY IF EXISTS region_row_filter ON CATALOG demos;
-# MAGIC
-# MAGIC CREATE POLICY region_row_filter ON CATALOG demos
-# MAGIC COMMENT 'Restrict rows to the analyst region. Driven by row_scope=region tag.'
-# MAGIC ROW FILTER region_filter_abac
-# MAGIC FOR TABLES MATCH COLUMNS has_tag_value('row_scope', 'region') AS region
-# MAGIC   ON COLUMN (region);
+policy_sql = f"""
+CREATE POLICY region_row_filter ON CATALOG `{catalog}`
+COMMENT 'Restrict rows to the analyst region. Driven by demo_row_scope=region tag.'
+ROW FILTER region_filter_abac
+TO `account users`
+FOR TABLES MATCH COLUMNS has_tag_value('demo_row_scope', 'region') AS region
+  USING COLUMNS (region)
+"""
+spark.sql(f"DROP POLICY IF EXISTS region_row_filter ON CATALOG `{catalog}`")
+spark.sql(policy_sql)
+print("Policy region_row_filter created.")
 
 # COMMAND ----------
 
@@ -167,8 +174,9 @@ spark.sql(f"USE SCHEMA `{schema}`")
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC -- DROP POLICY IF EXISTS region_row_filter ON CATALOG demos;
-# MAGIC -- DROP GOVERNED TAG IF EXISTS row_scope;
-# MAGIC -- DROP FUNCTION IF EXISTS region_filter;
-# MAGIC -- DROP FUNCTION IF EXISTS region_filter_abac;
+# spark.sql(f"DROP POLICY IF EXISTS region_row_filter ON CATALOG `{catalog}`")
+# spark.sql("DROP FUNCTION IF EXISTS region_filter")
+# spark.sql("DROP FUNCTION IF EXISTS region_filter_abac")
+# spark.sql("ALTER TABLE customers    ALTER COLUMN region UNSET TAGS ('demo_row_scope')")
+# spark.sql("ALTER TABLE transactions ALTER COLUMN region UNSET TAGS ('demo_row_scope')")
+# spark.sql("DROP GOVERNED TAG demo_row_scope")  # requires account admin

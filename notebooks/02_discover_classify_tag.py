@@ -5,9 +5,13 @@
 # MAGIC Two-part story:
 # MAGIC
 # MAGIC 1. **`ai_classify`** — let the platform tell us which columns look like PII, instead of us combing through them manually.
-# MAGIC 2. **Governed Tags** — apply a controlled-vocabulary tag (`sensitivity_level`) to those columns so downstream policies can act on the classification.
+# MAGIC 2. **Governed Tags** — apply a controlled-vocabulary tag (`demo_sensitivity`) to those columns so downstream policies can act on the classification.
 # MAGIC
-# MAGIC > **Why governed tags vs. regular tags?** Governed tags have an allowed-value list and `ASSIGN` privilege. Anyone with permission on the table can scribble whatever they want into a regular tag — that's fine for documentation, useless for security. Governed tags are auditable, restricted-vocabulary metadata you can safely build policies on top of.
+# MAGIC > **Why governed tags vs. regular tags?** Governed tags have an allowed-value list and live at the account level. Anyone with `APPLY TAG` on a securable can scribble whatever they want into a regular tag — that's fine for documentation, useless for security. Governed tags are auditable, restricted-vocabulary metadata you can safely build policies on top of.
+# MAGIC
+# MAGIC > **Tag name convention** — we use `demo_sensitivity` (rather than a generic name like `sensitivity_level`) because governed tags live at the **account** level. A generic name will collide with what your customer or another demo already created. Pick a unique name per demo.
+# MAGIC
+# MAGIC > **Built-in classification tags** — this account may already have `class.email_address`, `class.us_ssn`, `class.credit_card`, etc. Those are system tags from Databricks' built-in PII classification. Run `SHOW GOVERNED TAGS LIKE 'class.*'` to see them — a great talking point.
 
 # COMMAND ----------
 
@@ -32,19 +36,20 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Sample a handful of distinct values per column, classify each, and aggregate.
-# MAGIC -- This is a demo pattern — in production you'd run it via a job over your full catalog.
+# MAGIC -- Sample a handful of values per column, classify each, and aggregate.
+# MAGIC -- In production you'd run this via a job over your full catalog.
+# MAGIC -- Note: LIMIT inside UNION ALL branches needs parens; QUALIFY needs an explicit aggregation CTE.
 # MAGIC WITH sampled AS (
-# MAGIC   SELECT 'email'       AS column_name, CAST(email       AS STRING) AS sample_value FROM customers LIMIT 20
-# MAGIC   UNION ALL SELECT 'ssn',         CAST(ssn         AS STRING) FROM customers LIMIT 20
-# MAGIC   UNION ALL SELECT 'credit_card', CAST(credit_card AS STRING) FROM customers LIMIT 20
-# MAGIC   UNION ALL SELECT 'phone',       CAST(phone       AS STRING) FROM customers LIMIT 20
-# MAGIC   UNION ALL SELECT 'full_name',   CAST(full_name   AS STRING) FROM customers LIMIT 20
-# MAGIC   UNION ALL SELECT 'address',     CAST(address     AS STRING) FROM customers LIMIT 20
-# MAGIC   UNION ALL SELECT 'city',        CAST(city        AS STRING) FROM customers LIMIT 20
-# MAGIC   UNION ALL SELECT 'region',      CAST(region      AS STRING) FROM customers LIMIT 20
-# MAGIC   UNION ALL SELECT 'dob',         CAST(dob         AS STRING) FROM customers LIMIT 20
-# MAGIC   UNION ALL SELECT 'signup_date', CAST(signup_date AS STRING) FROM customers LIMIT 20
+# MAGIC   (SELECT 'email'       AS column_name, CAST(email       AS STRING) AS sample_value FROM customers LIMIT 20)
+# MAGIC   UNION ALL (SELECT 'ssn',         CAST(ssn         AS STRING) FROM customers LIMIT 20)
+# MAGIC   UNION ALL (SELECT 'credit_card', CAST(credit_card AS STRING) FROM customers LIMIT 20)
+# MAGIC   UNION ALL (SELECT 'phone',       CAST(phone       AS STRING) FROM customers LIMIT 20)
+# MAGIC   UNION ALL (SELECT 'full_name',   CAST(full_name   AS STRING) FROM customers LIMIT 20)
+# MAGIC   UNION ALL (SELECT 'address',     CAST(address     AS STRING) FROM customers LIMIT 20)
+# MAGIC   UNION ALL (SELECT 'city',        CAST(city        AS STRING) FROM customers LIMIT 20)
+# MAGIC   UNION ALL (SELECT 'region',      CAST(region      AS STRING) FROM customers LIMIT 20)
+# MAGIC   UNION ALL (SELECT 'dob',         CAST(dob         AS STRING) FROM customers LIMIT 20)
+# MAGIC   UNION ALL (SELECT 'signup_date', CAST(signup_date AS STRING) FROM customers LIMIT 20)
 # MAGIC ),
 # MAGIC classified AS (
 # MAGIC   SELECT
@@ -55,14 +60,15 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # MAGIC             'date_of_birth', 'geographic_region', 'non_pii')
 # MAGIC     ) AS predicted_label
 # MAGIC   FROM sampled
+# MAGIC ),
+# MAGIC counted AS (
+# MAGIC   SELECT column_name, predicted_label, count(*) AS votes
+# MAGIC   FROM classified
+# MAGIC   GROUP BY column_name, predicted_label
 # MAGIC )
-# MAGIC SELECT
-# MAGIC   column_name,
-# MAGIC   predicted_label,
-# MAGIC   count(*) AS votes
-# MAGIC FROM classified
-# MAGIC GROUP BY column_name, predicted_label
-# MAGIC QUALIFY row_number() OVER (PARTITION BY column_name ORDER BY count(*) DESC) = 1
+# MAGIC SELECT column_name, predicted_label, votes
+# MAGIC FROM counted
+# MAGIC QUALIFY row_number() OVER (PARTITION BY column_name ORDER BY votes DESC) = 1
 # MAGIC ORDER BY column_name;
 
 # COMMAND ----------
@@ -82,25 +88,27 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Drop first if re-running the demo. Detach uses first if any policies reference it.
-# MAGIC DROP GOVERNED TAG IF EXISTS sensitivity_level;
-# MAGIC
-# MAGIC CREATE GOVERNED TAG sensitivity_level
+# MAGIC -- Governed tags live at the ACCOUNT level. CREATE will fail if the tag already exists.
+# MAGIC -- If you need to re-run, drop it manually as an account admin: DROP GOVERNED TAG demo_sensitivity
+# MAGIC -- (Note: DROP GOVERNED TAG IF EXISTS is not currently supported.)
+# MAGIC CREATE GOVERNED TAG demo_sensitivity
 # MAGIC   DESCRIPTION 'Data sensitivity classification — drives masking and access policies'
 # MAGIC   VALUES ('pii', 'financial', 'public');
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Part 3 — Grant `ASSIGN` to data stewards
+# MAGIC ## Part 3 — Grant tag-apply privilege
 # MAGIC
-# MAGIC Only stewards can apply this tag. Everyone else sees it on tables (read-only) but can't change it.
+# MAGIC To restrict who can apply this tag, grant `APPLY TAG` on the catalog (or schema/table) to stewards. The grant is on the **target** of the tag, not on the tag itself.
+# MAGIC
+# MAGIC In a real engagement you'd grant `APPLY TAG ON CATALOG` to your stewards group and revoke broader rights from everyone else.
 
 # COMMAND ----------
 
 stewards_group = dbutils.widgets.get("group_stewards")
-spark.sql(f"GRANT ASSIGN ON GOVERNED TAG sensitivity_level TO `{stewards_group}`")
-print(f"Granted ASSIGN on sensitivity_level → {stewards_group}")
+spark.sql(f"GRANT APPLY TAG ON CATALOG `{catalog}` TO `{stewards_group}`")
+print(f"Granted APPLY TAG on catalog {catalog} → {stewards_group}")
 
 # COMMAND ----------
 
@@ -112,13 +120,19 @@ print(f"Granted ASSIGN on sensitivity_level → {stewards_group}")
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC SET TAG sensitivity_level = 'pii' ON COLUMN customers.email;
-# MAGIC SET TAG sensitivity_level = 'pii' ON COLUMN customers.ssn;
-# MAGIC SET TAG sensitivity_level = 'pii' ON COLUMN customers.phone;
-# MAGIC SET TAG sensitivity_level = 'pii' ON COLUMN customers.full_name;
-# MAGIC SET TAG sensitivity_level = 'pii' ON COLUMN customers.address;
-# MAGIC SET TAG sensitivity_level = 'pii' ON COLUMN customers.dob;
-# MAGIC SET TAG sensitivity_level = 'financial' ON COLUMN customers.credit_card;
+# MAGIC -- Syntax: ALTER TABLE ... ALTER COLUMN ... SET TAGS ('tag_name' = 'value')
+# MAGIC -- (The shorter `SET TAG name = value ON COLUMN tbl.col` syntax exists in some docs but is not currently supported by the SQL parser — use ALTER TABLE.)
+# MAGIC ALTER TABLE customers ALTER COLUMN email       SET TAGS ('demo_sensitivity' = 'pii');
+# MAGIC ALTER TABLE customers ALTER COLUMN ssn         SET TAGS ('demo_sensitivity' = 'pii');
+# MAGIC ALTER TABLE customers ALTER COLUMN phone       SET TAGS ('demo_sensitivity' = 'pii');
+# MAGIC ALTER TABLE customers ALTER COLUMN full_name   SET TAGS ('demo_sensitivity' = 'pii');
+# MAGIC ALTER TABLE customers ALTER COLUMN address     SET TAGS ('demo_sensitivity' = 'pii');
+# MAGIC ALTER TABLE customers ALTER COLUMN credit_card SET TAGS ('demo_sensitivity' = 'financial');
+# MAGIC
+# MAGIC -- NOTE: we deliberately do NOT tag `dob` (a DATE column) with `pii`. ABAC policies cannot
+# MAGIC -- have two masks matching the same column, and a single mask UDF can only handle one data
+# MAGIC -- type. To mask DATEs you'd use a separate tag value (e.g. 'pii_date') and a second policy.
+# MAGIC -- See notebook 03 for the explanation.
 
 # COMMAND ----------
 
@@ -128,9 +142,9 @@ print(f"Granted ASSIGN on sensitivity_level → {stewards_group}")
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC SET TAG sensitivity_level = 'financial' ON COLUMN transactions.amount;
-# MAGIC SET TAG sensitivity_level = 'pii'       ON COLUMN support_notes.note_text;
-# MAGIC SET TAG sensitivity_level = 'pii'       ON COLUMN support_notes.agent_name;
+# MAGIC ALTER TABLE transactions  ALTER COLUMN amount     SET TAGS ('demo_sensitivity' = 'financial');
+# MAGIC ALTER TABLE support_notes ALTER COLUMN note_text  SET TAGS ('demo_sensitivity' = 'pii');
+# MAGIC ALTER TABLE support_notes ALTER COLUMN agent_name SET TAGS ('demo_sensitivity' = 'pii');
 
 # COMMAND ----------
 
@@ -142,7 +156,7 @@ print(f"Granted ASSIGN on sensitivity_level → {stewards_group}")
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC SET TAG sensitivity_level = 'financial' ON TABLE transactions;
+# MAGIC ALTER TABLE transactions SET TAGS ('demo_sensitivity' = 'financial');
 
 # COMMAND ----------
 
@@ -188,6 +202,6 @@ print(f"Granted ASSIGN on sensitivity_level → {stewards_group}")
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- UNSET TAG sensitivity_level ON COLUMN customers.email;
+# MAGIC -- ALTER TABLE customers ALTER COLUMN email UNSET TAGS ('demo_sensitivity');
 # MAGIC -- ... (repeat for each tagged column/table)
-# MAGIC -- DROP GOVERNED TAG IF EXISTS sensitivity_level;
+# MAGIC -- DROP GOVERNED TAG demo_sensitivity;  -- requires account admin; IF EXISTS not supported

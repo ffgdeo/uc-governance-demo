@@ -95,9 +95,9 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC SET TAG sensitivity_level = 'pii' ON COLUMN customer_summary_mart.full_name;
-# MAGIC SET TAG sensitivity_level = 'pii' ON COLUMN customer_summary_mart.email;
-# MAGIC SET TAG row_scope         = 'region' ON COLUMN customer_summary_mart.region;
+# MAGIC ALTER TABLE customer_summary_mart ALTER COLUMN full_name SET TAGS ('demo_sensitivity' = 'pii');
+# MAGIC ALTER TABLE customer_summary_mart ALTER COLUMN email     SET TAGS ('demo_sensitivity' = 'pii');
+# MAGIC ALTER TABLE customer_summary_mart ALTER COLUMN region    SET TAGS ('demo_row_scope'   = 'region');
 # MAGIC
 # MAGIC -- And now the ABAC policies cover the mart too — automatically.
 # MAGIC SELECT * FROM customer_summary_mart LIMIT 5;
@@ -125,6 +125,9 @@ WHERE target_table_catalog = '{catalog_lower}'
 ORDER BY event_time DESC
 LIMIT 50
 """).display()
+
+# Note: system.access.table_lineage can take ~15 min to populate after the underlying operation.
+# If the result is empty or source_table_full_name is NULL, wait and re-run.
 
 # COMMAND ----------
 

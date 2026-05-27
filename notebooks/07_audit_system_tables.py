@@ -8,8 +8,8 @@
 # MAGIC
 # MAGIC This notebook shows three queries you'd put on a governance dashboard:
 # MAGIC
-# MAGIC 1. **Current state** — what's tagged, by what policy, where (information_schema, near-real-time)
-# MAGIC 2. **Recent activity** — who applied/changed tags and policies, who queried sensitive tables (system.access.audit, ~15min lag)
+# MAGIC 1. **Current state** — what's tagged, by what policy, where (`information_schema`, near-real-time)
+# MAGIC 2. **Recent activity** — who applied/changed tags and policies, who queried sensitive tables (`system.access.audit`, ~15min lag)
 # MAGIC 3. **Drift detection** — PII-looking columns that aren't yet tagged
 
 # COMMAND ----------
@@ -82,7 +82,7 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # MAGIC   FROM system.information_schema.column_tags
 # MAGIC   WHERE catalog_name = current_catalog()
 # MAGIC     AND schema_name  = current_schema()
-# MAGIC     AND tag_name = 'sensitivity_level'
+# MAGIC     AND tag_name = 'demo_sensitivity'
 # MAGIC )
 # MAGIC SELECT
 # MAGIC   count(*)                                                                 AS total_columns,
@@ -94,58 +94,78 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Recent activity — system.access.audit
+# MAGIC ## 2. Recent activity — `system.access.audit`
+# MAGIC
+# MAGIC > **Action names vary** by audit-log version. The names below match current internal-audit shapes (createTagPolicy, UpdateTagSubentityAssignments, etc.). If you see no rows, try the broader filter `lower(action_name) LIKE '%tag%'` to discover what your workspace actually emits.
+# MAGIC >
+# MAGIC > **Lag**: audit log writes lag the action by ~15 min. If a recent change isn't showing up, wait and re-run.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Tag changes
+# MAGIC ### Tag policy changes (governed tag CREATE/DROP)
 # MAGIC
-# MAGIC Who applied, changed, or removed which tag.
+# MAGIC Who created, dropped, or modified a governed tag.
 
 # COMMAND ----------
 
 spark.sql(f"""
 SELECT
   event_time,
-  user_identity.email AS actor,
+  user_identity.email                        AS actor,
   action_name,
-  request_params['full_name_arg']  AS target,
-  request_params['tag_name']       AS tag_name,
-  request_params['tag_value']      AS tag_value
+  substring(to_json(request_params), 1, 200) AS request_params
 FROM system.access.audit
 WHERE event_time > current_date() - INTERVAL {days_back} DAY
-  AND action_name IN ('setTags','updateTags','deleteTags',
-                      'setGovernedTag','removeGovernedTag',
-                      'createGovernedTag','dropGovernedTag')
+  AND action_name IN ('createTagPolicy', 'deleteTagPolicy', 'updateTagPolicy',
+                      'legacyCreateTagPolicy', 'legacyDeleteTagPolicy', 'legacyUpdateTagPolicy')
 ORDER BY event_time DESC
-LIMIT 100
+LIMIT 50
 """).display()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Policy changes
+# MAGIC ### Tag assignments (who tagged what)
 # MAGIC
-# MAGIC Who created/dropped/altered an ABAC policy. This is the audit trail you'd want to show a compliance team.
+# MAGIC `UpdateTagSubentityAssignments` covers columns and `UpdateTagSecurableAssignments` covers tables/schemas/catalogs.
 
 # COMMAND ----------
 
 spark.sql(f"""
 SELECT
   event_time,
-  user_identity.email AS actor,
+  user_identity.email                        AS actor,
   action_name,
-  request_params['policy_name']  AS policy_name,
-  request_params['target_type']  AS target_type,
-  request_params['target_name']  AS target_name
+  substring(to_json(request_params), 1, 300) AS request_params
 FROM system.access.audit
 WHERE event_time > current_date() - INTERVAL {days_back} DAY
-  AND action_name IN ('createPolicy','dropPolicy','alterPolicy',
-                      'setColumnMask','dropColumnMask',
-                      'setRowFilter','dropRowFilter')
+  AND action_name IN ('UpdateTagSubentityAssignments', 'UpdateTagSecurableAssignments',
+                      'createTagAssignment', 'updateTagAssignments', 'deleteTagAssignment')
 ORDER BY event_time DESC
-LIMIT 100
+LIMIT 50
+""").display()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### ABAC policy changes
+# MAGIC
+# MAGIC Who created or dropped an ABAC policy. This is the audit trail you'd want to show a compliance team.
+
+# COMMAND ----------
+
+spark.sql(f"""
+SELECT
+  event_time,
+  user_identity.email                        AS actor,
+  action_name,
+  substring(to_json(request_params), 1, 300) AS request_params
+FROM system.access.audit
+WHERE event_time > current_date() - INTERVAL {days_back} DAY
+  AND action_name IN ('createPolicy', 'dropPolicy', 'alterPolicy', 'updatePolicy')
+ORDER BY event_time DESC
+LIMIT 50
 """).display()
 
 # COMMAND ----------
@@ -153,7 +173,7 @@ LIMIT 100
 # MAGIC %md
 # MAGIC ### Reads of tagged tables
 # MAGIC
-# MAGIC Anyone who queried a table in this schema that has a `sensitivity_level` tag. Pairs nicely with a SIEM export.
+# MAGIC Anyone who queried a table in this schema that has a `demo_sensitivity` tag. Pairs nicely with a SIEM export.
 
 # COMMAND ----------
 
@@ -167,18 +187,21 @@ WITH sensitive_tables AS (
   FROM system.information_schema.column_tags
   WHERE catalog_name = '{catalog_lower}'
     AND schema_name  = '{schema_lower}'
-    AND tag_name = 'sensitivity_level'
+    AND tag_name = 'demo_sensitivity'
 )
 SELECT
   a.event_time,
   a.user_identity.email AS actor,
   a.action_name,
-  a.request_params['table_full_name'] AS table_full_name
+  coalesce(
+    a.request_params['table_full_name'],
+    a.request_params['full_name_arg']
+  ) AS table_full_name
 FROM system.access.audit a
 JOIN sensitive_tables s
-  ON a.request_params['table_full_name'] = s.full_table
+  ON coalesce(a.request_params['table_full_name'], a.request_params['full_name_arg']) = s.full_table
 WHERE a.event_time > current_date() - INTERVAL {days_back} DAY
-  AND a.action_name IN ('getTable','listTables','executeStatement','commandSubmit')
+  AND a.action_name IN ('getTable', 'listTables', 'commandSubmit', 'executeStatement')
 ORDER BY a.event_time DESC
 LIMIT 200
 """).display()
@@ -203,7 +226,7 @@ LIMIT 200
 # MAGIC       FROM system.information_schema.column_tags
 # MAGIC       WHERE catalog_name = current_catalog()
 # MAGIC         AND schema_name  = current_schema()
-# MAGIC         AND tag_name = 'sensitivity_level'
+# MAGIC         AND tag_name = 'demo_sensitivity'
 # MAGIC     )
 # MAGIC )
 # MAGIC SELECT table_name, column_name

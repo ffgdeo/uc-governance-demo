@@ -4,6 +4,8 @@ A reusable demo showing how **Governed Tags + ABAC policies + column masks + row
 
 Audience: customers asking "how do I manage permissions across hundreds of tables without writing one policy per column?"
 
+> **Tested 2026-05-27** on a serverless FEVM workspace (`fevm-fd-serverless-workspace`) against `fd_serverless_workspace_catalog`. Every notebook's SQL ran end-to-end; the governance-loop story (data gen → classify → tag → mask + filter → ai_mask → lineage → audit) was validated.
+
 ---
 
 ## What this demo shows
@@ -79,11 +81,21 @@ A `_teardown.sql` cell at the bottom of each notebook removes what it created. O
 
 ---
 
-## Gotchas
+## Gotchas (learned the hard way while building this)
 
-- **`column_value`** is the implicit parameter name inside `COLUMN MASK` UDFs — use that exact identifier, don't rename it (one of the more common ABAC bugs).
-- **Tag inheritance** flows catalog → schema → table → column. A tag set at catalog level is visible (but not editable) on every child. Resolve conflicts by setting the more specific level.
-- **Policies are evaluated by privilege, not by user.** `TO 'pii-readers'` actually means "users who *are members of* `pii-readers`." Same group can be granted via multiple policies — they OR together.
+- **Governed tags live at the ACCOUNT level.** Pick demo-unique names like `demo_sensitivity` — a generic `sensitivity_level` will collide with whatever your customer or another demo already created. `CREATE GOVERNED TAG` fails outright on collision.
+- **`column_value`** is the required parameter name inside `COLUMN MASK` UDFs — use that exact identifier, don't rename it.
+- **The two policy clause shapes are different:**
+  - `COLUMN MASK fn TO grp FOR TABLES MATCH COLUMNS … AS c ON COLUMN c`
+  - `ROW FILTER fn TO grp FOR TABLES MATCH COLUMNS … AS c USING COLUMNS (c)`
+  - `ROW FILTER` uses `USING COLUMNS (…)`, not `ON COLUMN`. Easy to mix up.
+- **No overlapping ABAC matches.** UC rejects queries where two policies match the same column. Mixing a STRING mask and a DATE mask on the same `pii` tag won't work — use per-type tag values (`pii_string`, `pii_date`) and one policy per type. Notebook 03 explains the pattern.
+- **Add the demo-runner bypass.** UDFs in notebooks 03–05 include `is_member('admins')` so workspace admins can sanity-check unmasked output. Remove that clause for production rollouts.
+- **`MATCH COLUMNS` predicates are limited.** Only `has_tag()` and `has_tag_value()` are supported — no type filtering or other expressions.
+- **`SET TAG … ON COLUMN` doesn't parse.** Despite appearing in some older docs, the working syntax is `ALTER TABLE … ALTER COLUMN … SET TAGS ('tag' = 'value')`.
+- **`DROP GOVERNED TAG IF EXISTS` is not supported.** Drop without `IF EXISTS`, or use try/except.
+- **Re-running notebook 05** drops and re-creates `demo_sensitivity` to add a new value (`pii_freetext`). Requires you to be the tag creator OR an account admin.
+- **Tag inheritance** flows catalog → schema → table → column. A tag set at catalog level is visible (but not editable) on every child.
 - **ABAC is Public Preview** as of this writing. Verify against your workspace's release channel before promising customers GA dates.
 - **System tables lag** by ~15 min for audit, near-real-time for `information_schema`.
 
