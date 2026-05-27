@@ -76,8 +76,9 @@ Every notebook is parameterized via widgets — set `catalog` and `schema` once 
 
 1. **Clone into a Databricks workspace.** Add Repo → `https://github.com/ffgdeo/uc-governance-demo.git` (or your fork).
 2. **Run 00 + 01 ahead of the call.** Data generation takes 1–2 min and isn't a great live demo. Have the data ready.
-3. **Live-demo 02 through 07** in order. Each notebook is ~5–10 min of screen-share.
-4. **Trim based on customer interest.** Notebook 02 is the foundation. 03 and 04 are the "money slides." 05/06/07 are bonus depending on time.
+3. **Enable Data Classification on your target catalog/schema** at least 30 min before the call so the scan completes.
+4. **Follow [DEMO_FLOW.md](DEMO_FLOW.md)** — full ~30 min walkthrough with persona-switch tips and timing.
+5. **Trim based on customer interest.** The classification UI tour (step 2–4 in DEMO_FLOW) is the headline. Notebooks 03–04 are the "money slides." 05–07 are bonus.
 
 ### Tear-down
 
