@@ -24,20 +24,19 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # MAGIC %md
 # MAGIC ## Approach A — Legacy `SET ROW FILTER`
 # MAGIC
-# MAGIC A UDF that returns BOOLEAN per row, attached to one table at a time.
-# MAGIC
-# MAGIC > **Demo runner bypass** — the UDF includes `is_member('admins')` so workspace admins (you, running the demo) always see all rows. Remove that clause when wiring up a real customer environment.
+# MAGIC A UDF that returns BOOLEAN per row, attached to one table at a time. The legacy approach has no policy-level audience controls, so the UDF must do all of: (a) decide *who is in scope*, and (b) decide *which rows that user can see*. Note how access control and row routing are tangled together.
 
 # COMMAND ----------
 
 # MAGIC %sql
+# MAGIC -- Legacy: UDF has to handle both "who can use this" and "which row matches".
+# MAGIC -- Compare with the ABAC version below where TO/EXCEPT in the policy handles (a).
 # MAGIC CREATE OR REPLACE FUNCTION region_filter(region_col STRING)
 # MAGIC RETURNS BOOLEAN
 # MAGIC RETURN
-# MAGIC   is_member('admins')                                                       -- demo-runner bypass
-# MAGIC   OR is_account_group_member('pii-readers')                                 -- privileged readers
-# MAGIC   OR (is_account_group_member('analysts-east') AND region_col = 'east')
-# MAGIC   OR (is_account_group_member('analysts-west') AND region_col = 'west');
+# MAGIC   is_account_group_member('pii-readers')                                    -- privileged readers see all rows
+# MAGIC   OR (is_account_group_member('analysts-east') AND region_col = 'east')     -- east analysts see east rows
+# MAGIC   OR (is_account_group_member('analysts-west') AND region_col = 'west');    -- west analysts see west rows
 # MAGIC
 # MAGIC -- Attach to the transactions table.
 # MAGIC ALTER TABLE transactions SET ROW FILTER region_filter ON (region);
@@ -93,17 +92,19 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # MAGIC %md
 # MAGIC ### Step 2 — the row filter UDF
 # MAGIC
+# MAGIC Unlike column masks, the row-filter UDF *does* need group logic — because "east analysts see east rows, west analysts see west rows" is a per-row attribute match that can't be expressed in the policy's `TO/EXCEPT` clauses. But notice we're **only** doing routing here, not access control. The `TO/EXCEPT` clauses in the policy below still handle "who is in scope at all."
+# MAGIC
 # MAGIC The parameter name must match the alias declared in the policy's `MATCH COLUMNS ... AS` clause.
 
 # COMMAND ----------
 
 # MAGIC %sql
+# MAGIC -- Pure row-routing logic. No "privileged readers see all" line — that case is handled by
+# MAGIC -- the policy's `EXCEPT pii-readers` clause (the UDF isn't even called for them).
 # MAGIC CREATE OR REPLACE FUNCTION region_filter_abac(region STRING)
 # MAGIC RETURNS BOOLEAN
 # MAGIC RETURN
-# MAGIC   is_member('admins')
-# MAGIC   OR is_account_group_member('pii-readers')
-# MAGIC   OR (is_account_group_member('analysts-east') AND region = 'east')
+# MAGIC   (is_account_group_member('analysts-east') AND region = 'east')
 # MAGIC   OR (is_account_group_member('analysts-west') AND region = 'west');
 
 # COMMAND ----------
@@ -114,14 +115,19 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # MAGIC Note the differences from `COLUMN MASK`:
 # MAGIC - Uses `USING COLUMNS (...)` (not `ON COLUMN`) to pass the matched column to the UDF
 # MAGIC - The `TO` clause comes before `FOR TABLES`
+# MAGIC
+# MAGIC As with the mask policies, `EXCEPT \`pii-readers\`` lets privileged users bypass the row filter entirely (see all rows). The UDF handles routing only.
 
 # COMMAND ----------
 
+dbutils.widgets.text("group_pii_readers", "pii-readers", "PII readers group (account-level)")
+pii_readers = dbutils.widgets.get("group_pii_readers")
+
 policy_sql = f"""
 CREATE POLICY region_row_filter ON CATALOG `{catalog}`
-COMMENT 'Restrict rows to the analyst region. Driven by demo_row_scope=region tag.'
+COMMENT 'Restrict rows to the analyst region. Driven by demo_row_scope=region tag. Bypassed for pii-readers.'
 ROW FILTER region_filter_abac
-TO `account users`
+TO `account users` EXCEPT `{pii_readers}`
 FOR TABLES MATCH COLUMNS has_tag_value('demo_row_scope', 'region') AS region
   USING COLUMNS (region)
 """

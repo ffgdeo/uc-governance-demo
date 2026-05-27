@@ -148,16 +148,16 @@ for row in high_confidence:
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Reuses the mask_pii_string UDF from notebook 03.
-# MAGIC -- If you haven't run notebook 03 yet, recreate it:
+# MAGIC -- Reuses the mask_pii_string UDF from notebook 03 — pure transform, no access control.
+# MAGIC -- The policy's TO/EXCEPT clause decides who gets the mask applied (see notebook 03 for rationale).
 # MAGIC CREATE OR REPLACE FUNCTION mask_pii_string(column_value STRING)
 # MAGIC RETURNS STRING
-# MAGIC RETURN CASE
-# MAGIC   WHEN is_member('admins') OR is_account_group_member('pii-readers') THEN column_value
-# MAGIC   ELSE '***REDACTED***'
-# MAGIC END;
+# MAGIC RETURN '***REDACTED***';
 
 # COMMAND ----------
+
+dbutils.widgets.text("group_pii_readers", "pii-readers", "PII readers group (account-level)")
+pii_readers = dbutils.widgets.get("group_pii_readers")
 
 def drop_policy_if_exists(name, target):
     try:
@@ -168,9 +168,9 @@ def drop_policy_if_exists(name, target):
 
 policy_sql = f"""
 CREATE POLICY mask_class_pii ON CATALOG `{catalog}`
-COMMENT 'Mask any column flagged by UC Data Classification as PII'
+COMMENT 'Mask any column flagged by UC Data Classification as PII. Applies to all users except pii-readers.'
 COLUMN MASK mask_pii_string
-TO `account users`
+TO `account users` EXCEPT `{pii_readers}`
 FOR TABLES MATCH COLUMNS
   has_tag('class.email_address')
   OR has_tag('class.us_ssn')

@@ -30,12 +30,12 @@ Audience: customers asking "how do I manage permissions across hundreds of table
 - **DBR 16.4+** or a **SQL warehouse on the latest channel** (governed tags need DBR 16.1+; ABAC policies are in Public Preview and need 16.4+)
 - **Account/workspace admin** access to create governed tags and ABAC policies
 - **`ai_classify` / `ai_mask`** require Foundation Model APIs enabled in your workspace (Pay-per-token endpoints are fine)
-- **Three groups** in your workspace (or pass your own group names as widgets):
+- **Four account-level groups** (created in the Account Console, *not* in the workspace UI — UC ABAC policies only resolve account-level principals):
   - `data-stewards` — can apply governed tags
   - `pii-readers` — can see PII unmasked
   - `analysts-east` / `analysts-west` — restricted by row filter to their region
 
-If the groups don't exist yet, an account admin can create them in the Account Console → User management. The notebooks log a warning if they're missing but won't fail.
+If the groups don't exist yet, an account admin must create them at https://accounts.cloud.databricks.com → User management → Groups. **Workspace-only groups won't work** — `CREATE POLICY ... TO \`groupname\``  fails loudly with `PRINCIPAL_DOES_NOT_EXIST`, and `is_account_group_member('groupname')` silently returns false. The notebooks log a warning if any group is missing but won't fail at setup time.
 
 ---
 
@@ -85,6 +85,20 @@ Every notebook is parameterized via widgets — set `catalog` and `schema` once 
 A `_teardown.sql` cell at the bottom of each notebook removes what it created. Or just `DROP CATALOG demos CASCADE` (after detaching policies) when you're done.
 
 ---
+
+## Design pattern: dumb UDF + smart policy
+
+When building ABAC column masks (and the wrapper UDFs used by row filters), keep these two layers separate:
+
+- **UDF returns the masked value.** No `is_account_group_member`/`is_member` calls, no access-control logic. Just `RETURN '***REDACTED***'` (or `ai_mask(...)`, or a partial-mask transform).
+- **Policy decides who's in scope.** `CREATE POLICY ... COLUMN MASK fn TO \`account users\` EXCEPT \`pii-readers\`` means: apply the mask to all users *not in* `pii-readers`. Members of `pii-readers` get the raw column value.
+
+Why:
+- **Auditability** — `SHOW POLICIES` tells you exactly who can see PII. No need to also read every UDF body.
+- **Reusability** — one `mask_pii_string` UDF can back five different policies with five different audiences.
+- **Loud failures over silent ones** — `EXCEPT \`bad-group\`` errors with `PRINCIPAL_DOES_NOT_EXIST` at policy creation time. `is_account_group_member('bad-group')` silently returns `false` forever.
+
+**Row filters are different.** The row-filter UDF *does* need group routing logic (e.g. "east analysts see east rows, west analysts see west rows"), because that's a per-row attribute match that `TO/EXCEPT` can't express. But it should still be *only* routing — the policy's `TO/EXCEPT` still handles "who's in scope at all."
 
 ## Gotchas (learned the hard way while building this)
 

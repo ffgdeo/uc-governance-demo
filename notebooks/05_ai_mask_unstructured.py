@@ -107,31 +107,25 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # MAGIC %md
 # MAGIC ### Step 3c — the freetext mask UDF and policy
 # MAGIC
-# MAGIC The UDF calls `ai_mask` for everyone except workspace admins and `pii-readers`. The ABAC policy applies it to any column tagged `pii_freetext`.
+# MAGIC Same UDF/policy separation as notebook 03: the UDF just calls `ai_mask`, the policy's `TO/EXCEPT` clause decides who's in scope. See notebook 03's "Design pattern: dumb UDF + smart policy" cell for the rationale.
 
 # COMMAND ----------
 
 # MAGIC %sql
+# MAGIC -- Pure masking function. Calls ai_mask unconditionally.
+# MAGIC -- Access control lives in the policy (TO/EXCEPT), not here.
 # MAGIC CREATE OR REPLACE FUNCTION mask_pii_freetext(column_value STRING)
 # MAGIC RETURNS STRING
-# MAGIC RETURN CASE
-# MAGIC   WHEN is_member('admins') OR is_account_group_member('pii-readers') THEN column_value
-# MAGIC   ELSE ai_mask(
-# MAGIC     column_value,
-# MAGIC     ARRAY('email', 'phone', 'ssn', 'credit card number', 'street address', 'person name')
-# MAGIC   )
-# MAGIC END;
+# MAGIC RETURN ai_mask(
+# MAGIC   column_value,
+# MAGIC   ARRAY('email', 'phone', 'ssn', 'credit card number', 'street address', 'person name')
+# MAGIC );
 
 # COMMAND ----------
 
-policy_sql = f"""
-CREATE POLICY mask_pii_freetext_columns ON CATALOG `{catalog}`
-COMMENT 'AI-driven masking for free-text columns tagged demo_sensitivity=pii_freetext'
-COLUMN MASK mask_pii_freetext
-TO `account users`
-FOR TABLES MATCH COLUMNS has_tag_value('demo_sensitivity', 'pii_freetext') AS c
-  ON COLUMN c
-"""
+dbutils.widgets.text("group_pii_readers", "pii-readers", "PII readers group (account-level)")
+pii_readers = dbutils.widgets.get("group_pii_readers")
+
 def drop_policy_if_exists(name, target):
     try:
         spark.sql(f"DROP POLICY {name} ON {target}")
@@ -139,6 +133,14 @@ def drop_policy_if_exists(name, target):
         if "POLICY_NOT_FOUND" not in str(e):
             raise
 
+policy_sql = f"""
+CREATE POLICY mask_pii_freetext_columns ON CATALOG `{catalog}`
+COMMENT 'ai_mask for free-text columns tagged demo_sensitivity=pii_freetext. Applies to all users except pii-readers.'
+COLUMN MASK mask_pii_freetext
+TO `account users` EXCEPT `{pii_readers}`
+FOR TABLES MATCH COLUMNS has_tag_value('demo_sensitivity', 'pii_freetext') AS c
+  ON COLUMN c
+"""
 drop_policy_if_exists("mask_pii_freetext_columns", f"CATALOG `{catalog}`")
 spark.sql(policy_sql)
 print("Policy mask_pii_freetext_columns created.")

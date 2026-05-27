@@ -29,12 +29,12 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # MAGIC %md
 # MAGIC ## Approach A — Legacy per-column `SET MASK`
 # MAGIC
-# MAGIC Define a UDF, attach it to one column on one table.
+# MAGIC Define a UDF, attach it to one column on one table. There's no policy layer, so the UDF *has* to do its own access control — `is_account_group_member(...)` check baked into the function body. Keep an eye on this; the ABAC version below pulls that logic out of the UDF.
 
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- 1. Write a masking UDF. Members of `pii-readers` see the original; everyone else sees masked.
+# MAGIC -- 1. Write a masking UDF. With no policy layer, access control has to live IN the UDF.
 # MAGIC CREATE OR REPLACE FUNCTION mask_email_legacy(input_email STRING)
 # MAGIC RETURNS STRING
 # MAGIC RETURN CASE
@@ -80,6 +80,18 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # MAGIC
 # MAGIC One policy. It looks at the governed tag (`demo_sensitivity`) and applies wherever it's set to `pii`. New PII columns get protected the moment they're tagged.
 # MAGIC
+# MAGIC ### Design pattern: dumb UDF + smart policy
+# MAGIC
+# MAGIC There are two layers of control. Keep them separate:
+# MAGIC
+# MAGIC 1. **The UDF returns the masked value.** No group logic, no admin bypass. Just `RETURN '***REDACTED***'` (or `ai_mask(...)`, or a partial-mask transform). One UDF, reusable across many policies.
+# MAGIC 2. **The policy's `TO ... EXCEPT ...` decides who the policy applies to.** Anyone in `TO` *not in* `EXCEPT` gets the UDF result. Everyone else passes through unmasked.
+# MAGIC
+# MAGIC Why this matters:
+# MAGIC - **Auditability** — `SHOW POLICIES` tells you exactly who can see PII. No need to also read UDF bodies.
+# MAGIC - **Reusability** — the same `mask_pii_string` UDF can back five different policies with five different audiences. With group logic baked into the UDF, you'd end up writing one UDF per policy.
+# MAGIC - **Loud failures over silent ones** — `EXCEPT \`bad-group\`` errors with `PRINCIPAL_DOES_NOT_EXIST` at policy creation time. `is_account_group_member('bad-group')` silently returns `false` forever.
+# MAGIC
 # MAGIC ### The masking UDF
 # MAGIC
 # MAGIC `column_value` is the **required** placeholder name when used by an ABAC policy.
@@ -87,29 +99,29 @@ spark.sql(f"USE SCHEMA `{schema}`")
 # COMMAND ----------
 
 # MAGIC %sql
+# MAGIC -- Pure masking function — no access-control logic. The policy decides who hits this.
 # MAGIC CREATE OR REPLACE FUNCTION mask_pii_string(column_value STRING)
 # MAGIC RETURNS STRING
-# MAGIC RETURN CASE
-# MAGIC   WHEN is_account_group_member('pii-readers') THEN column_value
-# MAGIC   ELSE '***REDACTED***'
-# MAGIC END;
+# MAGIC RETURN '***REDACTED***';
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ### The ABAC policy
 # MAGIC
-# MAGIC Hits every column tagged `demo_sensitivity = 'pii'` across the entire catalog.
+# MAGIC Hits every column tagged `demo_sensitivity = 'pii'` across the entire catalog. `TO \`account users\` EXCEPT \`pii-readers\`` means: apply to everyone, *except* members of `pii-readers`.
 # MAGIC
-# MAGIC > **Note on the `TO` clause** — ABAC policies require a principal in the `TO` clause. Using `` `account users` `` (the built-in group containing every user) means the policy is *evaluated* for everyone. The UDF itself decides who gets the unmasked value via `is_account_group_member('pii-readers')`. Alternative: `TO \`account users\` EXCEPT \`pii-readers\`` skips the policy entirely for the readers group — slightly cleaner but harder to introspect.
+# MAGIC > **Account-level groups only** — principals in `TO`/`EXCEPT` must be account-level (created in the Account Console). Workspace-only groups won't resolve and the `CREATE POLICY` will fail loudly with `PRINCIPAL_DOES_NOT_EXIST`. Same is true if you use `is_account_group_member(...)` — it silently returns `false`, which is worse. Make sure `pii-readers` exists at account level before running this cell.
+# MAGIC >
+# MAGIC > **Demo runner verification** — as workspace admin running this notebook, you'll see masked output (you're in `account users`, not in `pii-readers`). To see unmasked, either (a) add yourself to `pii-readers` temporarily, (b) replace `pii-readers` with your own email as the `EXCEPT` principal (`EXCEPT \`you@company.com\``), or (c) have a teammate who *is* in `pii-readers` run the query.
 
 # COMMAND ----------
 
 policy_sql = f"""
 CREATE POLICY mask_all_pii_strings ON CATALOG `{catalog}`
-COMMENT 'Mask any STRING column tagged demo_sensitivity=pii'
+COMMENT 'Mask STRING columns tagged demo_sensitivity=pii. Applies to all users except pii-readers.'
 COLUMN MASK mask_pii_string
-TO `account users`
+TO `account users` EXCEPT `{pii_readers}`
 FOR TABLES MATCH COLUMNS has_tag_value('demo_sensitivity', 'pii') AS c
   ON COLUMN c
 """
