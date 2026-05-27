@@ -113,7 +113,15 @@ TO `account users`
 FOR TABLES MATCH COLUMNS has_tag_value('demo_sensitivity', 'pii') AS c
   ON COLUMN c
 """
-spark.sql(f"DROP POLICY IF EXISTS mask_all_pii_strings ON CATALOG `{catalog}`")
+def drop_policy_if_exists(name, target):
+    """`DROP POLICY IF EXISTS` is not supported — catch POLICY_NOT_FOUND."""
+    try:
+        spark.sql(f"DROP POLICY {name} ON {target}")
+    except Exception as e:
+        if "POLICY_NOT_FOUND" not in str(e):
+            raise
+
+drop_policy_if_exists("mask_all_pii_strings", f"CATALOG `{catalog}`")
 spark.sql(policy_sql)
 print("Policy mask_all_pii_strings created.")
 
@@ -197,7 +205,7 @@ print("Policy mask_all_pii_strings created.")
 
 # COMMAND ----------
 
-# spark.sql(f"DROP POLICY IF EXISTS mask_all_pii_strings ON CATALOG `{catalog}`")
+# drop_policy_if_exists("mask_all_pii_strings", f"CATALOG `{catalog}`")
 # spark.sql("DROP FUNCTION IF EXISTS mask_pii_string")
 # spark.sql("DROP FUNCTION IF EXISTS mask_email_legacy")
 # spark.sql("ALTER TABLE customers DROP COLUMN IF EXISTS passport_number")

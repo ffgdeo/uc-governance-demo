@@ -14,7 +14,8 @@ Audience: customers asking "how do I manage permissions across hundreds of table
 |---|----------|--------------|
 | 00 | `setup` | Create catalog/schema, set up demo personas |
 | 01 | `generate_data` | Faker-driven synthetic customers + transactions + free-text support notes with embedded PII |
-| 02 | `discover_classify_tag` | **`ai_classify`** auto-detects PII columns; **Governed Tags** classify data with controlled vocabulary |
+| **02a** | **`data_classification_system_tags`** | **UC Data Classification** auto-scans the catalog and applies `class.*` system tags. ABAC policies built directly on `has_tag('class.email_address')` etc. — **the recommended starting point** |
+| 02 | `discover_classify_tag` | `ai_classify`-driven discovery + custom `demo_sensitivity` governed tag (the path for *non*-standard classifications like `executive_only`, `q4_earnings`) |
 | 03 | `column_masks_old_vs_new` | Legacy per-column `SET MASK` (one policy per column per table) **vs** ABAC `CREATE POLICY ... COLUMN MASK` (one policy, all PII columns everywhere) |
 | 04 | `row_filters_abac` | Row-level filtering driven by tag + group membership |
 | 05 | `ai_mask_unstructured` | **`ai_mask`** redacts PII inside free-text columns (where structured masking can't help) |
@@ -56,13 +57,16 @@ The fastest way to "switch personas" in a live demo is to temporarily remove you
 ```
 notebooks/00_setup.py
 notebooks/01_generate_data.py
-notebooks/02_discover_classify_tag.py
+notebooks/02a_data_classification_system_tags.py  ← start here; UI-driven, "platform does the work"
+notebooks/02_discover_classify_tag.py             ← for custom/non-standard classifications
 notebooks/03_column_masks_old_vs_new.py
 notebooks/04_row_filters_abac.py
 notebooks/05_ai_mask_unstructured.py
 notebooks/06_lineage_and_propagation.py
 notebooks/07_audit_system_tables.py
 ```
+
+> **02a vs 02 — pick one for a customer demo.** Run both back-to-back only if the customer asks how to handle non-standard classifications. Otherwise pick `02a` (recommended — the managed feature is the cleaner story) and skip 02. The downstream notebooks (03+) work with either set of tags.
 
 Every notebook is parameterized via widgets — set `catalog` and `schema` once at the top of each. Defaults: `catalog=demos`, `schema=uc_governance`.
 
@@ -105,12 +109,13 @@ A `_teardown.sql` cell at the bottom of each notebook removes what it created. O
 
 ```
 uc-governance-demo/
-├── README.md                              # this file
+├── README.md                                       # this file
 ├── .gitignore
 └── notebooks/
     ├── 00_setup.py
     ├── 01_generate_data.py
-    ├── 02_discover_classify_tag.py
+    ├── 02a_data_classification_system_tags.py      # managed path (recommended)
+    ├── 02_discover_classify_tag.py                 # custom-tag path
     ├── 03_column_masks_old_vs_new.py
     ├── 04_row_filters_abac.py
     ├── 05_ai_mask_unstructured.py

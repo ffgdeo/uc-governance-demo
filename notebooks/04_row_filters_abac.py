@@ -125,7 +125,14 @@ TO `account users`
 FOR TABLES MATCH COLUMNS has_tag_value('demo_row_scope', 'region') AS region
   USING COLUMNS (region)
 """
-spark.sql(f"DROP POLICY IF EXISTS region_row_filter ON CATALOG `{catalog}`")
+def drop_policy_if_exists(name, target):
+    try:
+        spark.sql(f"DROP POLICY {name} ON {target}")
+    except Exception as e:
+        if "POLICY_NOT_FOUND" not in str(e):
+            raise
+
+drop_policy_if_exists("region_row_filter", f"CATALOG `{catalog}`")
 spark.sql(policy_sql)
 print("Policy region_row_filter created.")
 
@@ -174,7 +181,7 @@ print("Policy region_row_filter created.")
 
 # COMMAND ----------
 
-# spark.sql(f"DROP POLICY IF EXISTS region_row_filter ON CATALOG `{catalog}`")
+# drop_policy_if_exists("region_row_filter", f"CATALOG `{catalog}`")
 # spark.sql("DROP FUNCTION IF EXISTS region_filter")
 # spark.sql("DROP FUNCTION IF EXISTS region_filter_abac")
 # spark.sql("ALTER TABLE customers    ALTER COLUMN region UNSET TAGS ('demo_row_scope')")
